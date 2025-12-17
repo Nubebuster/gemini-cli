@@ -96,6 +96,48 @@ save_backup_prefs() {
     printf '%s\n' "$@" > "$prefs_file"
 }
 
+# Install pre-push hook to block pushing backup branch
+install_push_protection() {
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+    local hook_file="$repo_root/.git/hooks/pre-push"
+    local marker="# workflow-tool: block backup branch push"
+
+    # Check if our protection is already installed
+    if [[ -f "$hook_file" ]] && grep -q "$marker" "$hook_file" 2>/dev/null; then
+        return 0  # Already installed
+    fi
+
+    # Create or append to pre-push hook
+    if [[ ! -f "$hook_file" ]]; then
+        cat > "$hook_file" << 'HOOK'
+#!/usr/bin/env bash
+# workflow-tool: block backup branch push
+BLOCKED_BRANCH="nubebuster/local/workflow"
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [[ "$local_ref" == "refs/heads/$BLOCKED_BRANCH" ]]; then
+        echo "ERROR: Pushing '$BLOCKED_BRANCH' is blocked (contains private data)" >&2
+        exit 1
+    fi
+done
+HOOK
+        chmod +x "$hook_file"
+    else
+        # Append to existing hook
+        cat >> "$hook_file" << 'HOOK'
+
+# workflow-tool: block backup branch push
+BLOCKED_BRANCH="nubebuster/local/workflow"
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [[ "$local_ref" == "refs/heads/$BLOCKED_BRANCH" ]]; then
+        echo "ERROR: Pushing '$BLOCKED_BRANCH' is blocked (contains private data)" >&2
+        exit 1
+    fi
+done
+HOOK
+    fi
+}
+
 # =============================================================================
 # Colors and Output
 # =============================================================================
@@ -554,12 +596,15 @@ cmd_backup() {
         git stash pop || warn "Stash pop had conflicts"
     fi
 
-    info "Backup complete!"
+    # Ensure branch has no upstream (prevents accidental push)
+    git branch --unset-upstream "$ORPHAN_BRANCH" 2>/dev/null || true
 
-    if gum confirm "Push backup to origin?"; then
-        git push -u origin "$ORPHAN_BRANCH"
-        info "Pushed to origin/$ORPHAN_BRANCH"
-    fi
+    # Install pre-push hook to block pushing this branch
+    install_push_protection
+    info "Pre-push hook installed to block pushing backup branch"
+
+    info "Backup complete!"
+    warn "Note: Backup branch is LOCAL ONLY (never pushed) to protect private data"
 }
 
 cmd_restore() {
@@ -569,26 +614,14 @@ cmd_restore() {
     repo_root=$(get_repo_root)
     cd "$repo_root"
 
-    # Check if orphan branch exists
-    local orphan_ref=""
-    if git show-ref --verify --quiet "refs/heads/$ORPHAN_BRANCH" 2>/dev/null; then
-        orphan_ref="$ORPHAN_BRANCH"
-    elif git show-ref --verify --quiet "refs/remotes/origin/$ORPHAN_BRANCH" 2>/dev/null; then
-        orphan_ref="origin/$ORPHAN_BRANCH"
-    else
-        # Try fetching
-        info "Fetching from origin..."
-        git fetch origin "$ORPHAN_BRANCH" 2>/dev/null || true
-
-        if git show-ref --verify --quiet "refs/remotes/origin/$ORPHAN_BRANCH" 2>/dev/null; then
-            orphan_ref="origin/$ORPHAN_BRANCH"
-        else
-            error "Backup branch $ORPHAN_BRANCH not found locally or on origin"
-            return 1
-        fi
+    # Check if orphan branch exists (LOCAL ONLY - never pushed for privacy)
+    if ! git show-ref --verify --quiet "refs/heads/$ORPHAN_BRANCH" 2>/dev/null; then
+        error "Backup branch $ORPHAN_BRANCH not found locally"
+        error "Run './workflow-tool.bash backup' first to create it"
+        return 1
     fi
 
-    info "Restoring from: $orphan_ref"
+    info "Restoring from: $ORPHAN_BRANCH (local)"
 
     # Get local files list
     local local_files=()
@@ -598,8 +631,8 @@ cmd_restore() {
 
     # Restore each file
     for file in "${local_files[@]}"; do
-        if git show "$orphan_ref:$file" &>/dev/null; then
-            git show "$orphan_ref:$file" > "$file"
+        if git show "$ORPHAN_BRANCH:$file" &>/dev/null; then
+            git show "$ORPHAN_BRANCH:$file" > "$file"
             info "Restored: $file"
         else
             warn "File not in backup: $file"
@@ -655,14 +688,14 @@ cmd_status() {
     done < <(get_local_files)
     echo ""
 
-    # Check backup branch
-    echo -e "${BOLD}Backup Branch:${NC}"
+    # Check backup branch (local only - never pushed for privacy)
+    echo -e "${BOLD}Backup Branch (local only):${NC}"
     if git show-ref --verify --quiet "refs/heads/$ORPHAN_BRANCH" 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} $ORPHAN_BRANCH (local)"
-    elif git show-ref --verify --quiet "refs/remotes/origin/$ORPHAN_BRANCH" 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} $ORPHAN_BRANCH (remote only)"
+        local commit_count
+        commit_count=$(git rev-list --count "$ORPHAN_BRANCH" 2>/dev/null || echo "?")
+        echo -e "  ${GREEN}✓${NC} $ORPHAN_BRANCH ($commit_count backups)"
     else
-        echo -e "  ${YELLOW}✗${NC} $ORPHAN_BRANCH (not found)"
+        echo -e "  ${YELLOW}✗${NC} $ORPHAN_BRANCH (not created yet)"
     fi
     echo ""
 
