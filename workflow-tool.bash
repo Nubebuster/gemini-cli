@@ -29,6 +29,92 @@ ESLINT_CONFIG="eslint.config.js"
 # Valid branch types for naming convention
 BRANCH_TYPES=("fix" "feat" "refactor" "chore" "docs")
 
+# VSCode/Cursor settings paths for git autorefresh toggle
+VSCODE_SETTINGS="$HOME/.config/Code/User/settings.json"
+CURSOR_SETTINGS="$HOME/.config/Cursor/User/settings.json"
+
+# =============================================================================
+# VSCode Git Autorefresh Toggle
+# =============================================================================
+
+# Detect which editor settings file to use
+get_editor_settings_path() {
+    # Prefer Cursor if both exist and we're in a Cursor terminal
+    if [[ -f "$CURSOR_SETTINGS" ]]; then
+        echo "$CURSOR_SETTINGS"
+    elif [[ -f "$VSCODE_SETTINGS" ]]; then
+        echo "$VSCODE_SETTINGS"
+    else
+        echo ""
+    fi
+}
+
+# Track original autorefresh state for restoration
+_original_autorefresh=""
+_settings_path=""
+
+# Pause VSCode git autorefresh (call at start of git-heavy operations)
+pause_git_autorefresh() {
+    _settings_path=$(get_editor_settings_path)
+    [[ -z "$_settings_path" ]] && return 0
+
+    if ! command -v jq &>/dev/null; then
+        warn "jq not installed, skipping git autorefresh toggle"
+        return 0
+    fi
+
+    # Save original value (might be true, false, or unset)
+    _original_autorefresh=$(jq -r '.["git.autorefresh"] // "unset"' "$_settings_path" 2>/dev/null || echo "unset")
+
+    # Set to false
+    local tmp
+    tmp=$(mktemp)
+    if jq '.["git.autorefresh"] = false' "$_settings_path" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$_settings_path"
+        info "Paused VSCode git autorefresh"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+# Resume VSCode git autorefresh (call at end of git-heavy operations)
+# Idempotent - safe to call multiple times
+resume_git_autorefresh() {
+    [[ -z "$_settings_path" ]] && return 0
+    [[ ! -f "$_settings_path" ]] && return 0
+
+    if ! command -v jq &>/dev/null; then
+        _settings_path=""  # Mark as done
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+
+    if [[ "$_original_autorefresh" == "unset" ]]; then
+        # Remove the key if it wasn't set before
+        if jq 'del(.["git.autorefresh"])' "$_settings_path" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$_settings_path"
+        else
+            rm -f "$tmp"
+        fi
+    else
+        # Restore original value
+        if jq ".\"git.autorefresh\" = $_original_autorefresh" "$_settings_path" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$_settings_path"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+
+    info "Resumed VSCode git autorefresh"
+
+    # Trigger git extension refresh by touching the index
+    touch .git/index 2>/dev/null || true
+
+    _settings_path=""  # Mark as done (idempotent)
+}
+
 # =============================================================================
 # Dynamic LOCAL_FILES from .gitignore_local
 # =============================================================================
@@ -958,6 +1044,7 @@ interactive_menu() {
                 ;;
             "Exit"|"")
                 info "Goodbye!"
+                resume_git_autorefresh
                 exit 0
                 ;;
         esac
@@ -1003,6 +1090,10 @@ main() {
     repo_root=$(get_repo_root)
     cd "$repo_root"
 
+    # Pause VSCode git autorefresh for duration of script
+    pause_git_autorefresh
+    trap resume_git_autorefresh EXIT
+
     if [[ $# -eq 0 ]]; then
         interactive_menu
         exit 0
@@ -1036,9 +1127,13 @@ main() {
         *)
             error "Unknown command: $command"
             usage
+            resume_git_autorefresh
             exit 1
             ;;
     esac
+
+    # Explicit resume in case inner functions cleared the EXIT trap
+    resume_git_autorefresh
 }
 
 main "$@"
