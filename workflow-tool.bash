@@ -22,17 +22,79 @@ UPSTREAM_URL="https://github.com/google-gemini/gemini-cli"
 UPSTREAM_BRANCH="main"
 ORPHAN_BRANCH="nubebuster/local/workflow"
 GH_PR_SCRIPT="$HOME/Scripts/gh-pr.bash"
-
-# Files that are local-only (never committed to PR branches)
-LOCAL_FILES=(
-    "CLAUDE.md"
-    "workflow-tool.bash"
-    ".gitignore_local"
-    "eslint.config.js"
-)
+GITIGNORE_LOCAL=".gitignore_local"
+BACKUP_PREFS_FILE=".workflow-backup-prefs"
 
 # Valid branch types for naming convention
 BRANCH_TYPES=("fix" "feat" "refactor" "chore" "docs")
+
+# =============================================================================
+# Dynamic LOCAL_FILES from .gitignore_local
+# =============================================================================
+
+# Read local files list from .gitignore_local
+get_local_files() {
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+    local gitignore_path="$repo_root/$GITIGNORE_LOCAL"
+
+    if [[ ! -f "$gitignore_path" ]]; then
+        echo ""
+        return
+    fi
+
+    # Read non-empty, non-comment lines from .gitignore_local
+    grep -v '^#' "$gitignore_path" | grep -v '^[[:space:]]*$' | while read -r line; do
+        echo "$line"
+    done
+}
+
+# Get list of files that should be selected by default (not in exclude prefs)
+get_backup_selected() {
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+    local prefs_file="$repo_root/$BACKUP_PREFS_FILE"
+    local all_files=()
+    local selected=()
+
+    # Get all local files
+    while IFS= read -r file; do
+        [[ -n "$file" ]] && all_files+=("$file")
+    done < <(get_local_files)
+
+    # If no prefs file, default to selecting common ones
+    if [[ ! -f "$prefs_file" ]]; then
+        for file in "${all_files[@]}"; do
+            # Default: select workflow files, skip data/temp files
+            case "$file" in
+                *.jsonl|*.log|compacted.md|.history)
+                    ;;  # Skip these by default
+                *)
+                    selected+=("$file")
+                    ;;
+            esac
+        done
+    else
+        # Read prefs file - it contains files that SHOULD be selected
+        while IFS= read -r file; do
+            [[ -n "$file" ]] && selected+=("$file")
+        done < "$prefs_file"
+    fi
+
+    # Return comma-separated for gum --selected
+    local IFS=','
+    echo "${selected[*]}"
+}
+
+# Save backup preferences (files that were selected)
+save_backup_prefs() {
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+    local prefs_file="$repo_root/$BACKUP_PREFS_FILE"
+
+    # Write selected files to prefs (one per line)
+    printf '%s\n' "$@" > "$prefs_file"
+}
 
 # =============================================================================
 # Colors and Output
@@ -117,8 +179,15 @@ inject_eslint_ignore() {
 # Check if local files are present
 check_local_files() {
     local missing=()
-    for file in "${LOCAL_FILES[@]}"; do
-        [[ ! -f "$file" ]] && missing+=("$file")
+    local local_files=()
+
+    # Get local files from .gitignore_local
+    while IFS= read -r file; do
+        [[ -n "$file" ]] && local_files+=("$file")
+    done < <(get_local_files)
+
+    for file in "${local_files[@]}"; do
+        [[ ! -e "$file" ]] && missing+=("$file")
     done
 
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -335,26 +404,28 @@ cmd_backup() {
     repo_root=$(get_repo_root)
     cd "$repo_root"
 
-    # Check which files exist
+    # Get local files from .gitignore_local and check which exist
     local existing_files=()
-    for file in "${LOCAL_FILES[@]}"; do
-        if [[ -f "$file" ]]; then
-            existing_files+=("$file")
-        fi
-    done
+    while IFS= read -r file; do
+        [[ -n "$file" && -e "$file" ]] && existing_files+=("$file")
+    done < <(get_local_files)
 
     if [[ ${#existing_files[@]} -eq 0 ]]; then
-        warn "No local files found to backup"
+        warn "No local files found to backup (check $GITIGNORE_LOCAL)"
         return
     fi
 
+    # Get previously saved selection preferences
+    local default_selected
+    default_selected=$(get_backup_selected)
+
     # Let user select which files to backup (multi-select)
-    # Default: select all except eslint.config.js
+    # Selection is remembered from last time
     local selected
     selected=$(printf '%s\n' "${existing_files[@]}" | \
         gum choose --no-limit \
             --header="Select files to backup (space to toggle, enter to confirm):" \
-            --selected="CLAUDE.md,workflow-tool.bash,.gitignore_local")
+            --selected="$default_selected")
 
     if [[ -z "$selected" ]]; then
         info "No files selected, backup cancelled"
@@ -367,6 +438,19 @@ cmd_backup() {
         [[ -n "$file" ]] && files_to_backup+=("$file")
     done <<< "$selected"
 
+    # Save selection preferences for next time
+    save_backup_prefs "${files_to_backup[@]}"
+    info "Preferences saved to $BACKUP_PREFS_FILE"
+
+    # Always include .workflow-backup-prefs in backup
+    local prefs_in_list=false
+    for f in "${files_to_backup[@]}"; do
+        [[ "$f" == "$BACKUP_PREFS_FILE" ]] && prefs_in_list=true
+    done
+    if [[ "$prefs_in_list" == "false" && -f "$BACKUP_PREFS_FILE" ]]; then
+        files_to_backup+=("$BACKUP_PREFS_FILE")
+    fi
+
     info "Will backup: ${files_to_backup[*]}"
 
     if ! gum confirm "Proceed with backup to $ORPHAN_BRANCH?"; then
@@ -378,7 +462,7 @@ cmd_backup() {
     local temp_dir
     temp_dir=$(mktemp -d)
     for file in "${files_to_backup[@]}"; do
-        cp "$file" "$temp_dir/"
+        cp -r "$file" "$temp_dir/"
     done
     info "Files saved to temp directory"
 
@@ -395,7 +479,7 @@ cmd_backup() {
         if [[ -d "$temp_dir" ]]; then
             # Restore files from temp
             for file in "${files_to_backup[@]}"; do
-                [[ -f "$temp_dir/$(basename "$file")" ]] && cp "$temp_dir/$(basename "$file")" "$file"
+                [[ -e "$temp_dir/$(basename "$file")" ]] && cp -r "$temp_dir/$(basename "$file")" "$file"
             done
             rm -rf "$temp_dir"
         fi
@@ -437,7 +521,7 @@ cmd_backup() {
 
     # Copy files from temp to working directory
     for file in "${files_to_backup[@]}"; do
-        cp "$temp_dir/$(basename "$file")" "$file"
+        cp -r "$temp_dir/$(basename "$file")" "$file"
     done
 
     # Stage and commit
@@ -461,7 +545,7 @@ cmd_backup() {
 
     # Restore our local files from temp
     for file in "${files_to_backup[@]}"; do
-        cp "$temp_dir/$(basename "$file")" "$file"
+        cp -r "$temp_dir/$(basename "$file")" "$file"
     done
     rm -rf "$temp_dir"
 
@@ -506,8 +590,14 @@ cmd_restore() {
 
     info "Restoring from: $orphan_ref"
 
+    # Get local files list
+    local local_files=()
+    while IFS= read -r file; do
+        [[ -n "$file" ]] && local_files+=("$file")
+    done < <(get_local_files)
+
     # Restore each file
-    for file in "${LOCAL_FILES[@]}"; do
+    for file in "${local_files[@]}"; do
         if git show "$orphan_ref:$file" &>/dev/null; then
             git show "$orphan_ref:$file" > "$file"
             info "Restored: $file"
@@ -553,14 +643,16 @@ cmd_status() {
     echo ""
 
     # Check local files
-    echo -e "${BOLD}Local Files:${NC}"
-    for file in "${LOCAL_FILES[@]}"; do
-        if [[ -f "$file" ]]; then
-            echo -e "  ${GREEN}✓${NC} $file"
-        else
-            echo -e "  ${RED}✗${NC} $file (missing)"
+    echo -e "${BOLD}Local Files (from $GITIGNORE_LOCAL):${NC}"
+    while IFS= read -r file; do
+        if [[ -n "$file" ]]; then
+            if [[ -e "$file" ]]; then
+                echo -e "  ${GREEN}✓${NC} $file"
+            else
+                echo -e "  ${RED}✗${NC} $file (missing)"
+            fi
         fi
-    done
+    done < <(get_local_files)
     echo ""
 
     # Check backup branch

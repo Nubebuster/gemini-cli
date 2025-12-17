@@ -1,0 +1,5 @@
+.gitignore_local
+.claude
+workflow-tool.bash
+.workflow-backup-prefs
+CLAUDE.md
