@@ -203,14 +203,19 @@ inject_eslint_ignore() {
         return
     fi
 
-    # Check if .history/** already in ignores
-    if grep -q '".history/\*\*"' "$eslint_file" 2>/dev/null; then
+    # Check if .history/** already in ignores (handles both quote styles)
+    if grep -qE "['\"].history/\*\*['\"]" "$eslint_file" 2>/dev/null; then
         info "eslint.config.js already has .history/** ignore"
         return
     fi
 
-    # Inject after 'dist/**' line in ignores array
-    if grep -q '"dist/\*\*"' "$eslint_file"; then
+    # Inject after 'dist/**' line in ignores array (handles both quote styles)
+    if grep -q "'dist/\*\*'" "$eslint_file"; then
+        # Single quotes - match upstream style
+        sed -i "/'dist\/\*\*'/a\\      '.history/**'," "$eslint_file"
+        info "Injected .history/** into eslint.config.js"
+    elif grep -q '"dist/\*\*"' "$eslint_file"; then
+        # Double quotes
         sed -i '/"dist\/\*\*"/a\      ".history/**",' "$eslint_file"
         info "Injected .history/** into eslint.config.js"
     else
@@ -272,7 +277,14 @@ cmd_merge() {
         git remote add upstream "$UPSTREAM_URL"
     fi
 
-    # Stash tracked changes
+    # Reset eslint.config.js before stashing - we'll re-patch it from upstream anyway
+    # This prevents stash conflicts since eslint changes shouldn't be in the stash
+    if git diff --name-only | grep -q '^eslint.config.js$'; then
+        info "Resetting eslint.config.js (will be re-patched from upstream)"
+        git checkout -- eslint.config.js
+    fi
+
+    # Stash tracked changes (eslint.config.js excluded above)
     local stash_needed=false
     if ! git diff --quiet || ! git diff --cached --quiet; then
         info "Stashing tracked changes..."
@@ -280,34 +292,14 @@ cmd_merge() {
         stash_needed=true
     fi
 
-    # Backup eslint.config.js (it's gitignored but exists in upstream)
-    local backup_dir
-    backup_dir=$(mktemp -d)
-    local backed_up=false
-
-    if [[ -f "eslint.config.js" ]]; then
-        cp "eslint.config.js" "$backup_dir/"
-        rm "eslint.config.js"
-        backed_up=true
-    fi
-
-    # Cleanup function
+    # Cleanup function for error cases
     cleanup() {
         local exit_code=$?
-
-        # Restore eslint.config.js if backed up (we'll re-patch it)
-        if [[ "$backed_up" == "true" && -f "$backup_dir/eslint.config.js" ]]; then
-            # We want the upstream version, not our backup, then patch it
-            :
-        fi
-        rm -rf "$backup_dir"
-
         # Pop stash if needed
         if [[ "$stash_needed" == "true" ]]; then
             info "Restoring stashed changes..."
             git stash pop || warn "Stash pop had conflicts - resolve manually"
         fi
-
         return $exit_code
     }
     trap cleanup EXIT
@@ -321,6 +313,9 @@ cmd_merge() {
         git fetch upstream "$UPSTREAM_BRANCH"
     fi
 
+    # Clear skip-worktree on eslint.config.js so reset can overwrite it
+    git update-index --no-skip-worktree eslint.config.js 2>/dev/null || true
+
     # Reset to upstream
     info "Resetting to upstream/$UPSTREAM_BRANCH..."
     git reset --hard "upstream/$UPSTREAM_BRANCH"
@@ -328,9 +323,11 @@ cmd_merge() {
     # Now eslint.config.js is fresh from upstream, inject our ignore
     inject_eslint_ignore
 
+    # Re-enable skip-worktree so eslint.config.js doesn't show in git status
+    git update-index --skip-worktree eslint.config.js
+
     # Remove trap - we're done with critical section
     trap - EXIT
-    rm -rf "$backup_dir"
 
     # Pop stash if needed
     if [[ "$stash_needed" == "true" ]]; then
@@ -446,6 +443,11 @@ cmd_backup() {
     repo_root=$(get_repo_root)
     cd "$repo_root"
 
+    # Declare variables used in cleanup (for set -u compatibility)
+    local temp_dir=""
+    local stash_needed=false
+    local files_to_backup=()
+
     # Get local files from .gitignore_local and check which exist
     local existing_files=()
     while IFS= read -r file; do
@@ -475,7 +477,6 @@ cmd_backup() {
     fi
 
     # Convert newline-separated selection to array
-    local files_to_backup=()
     while IFS= read -r file; do
         [[ -n "$file" ]] && files_to_backup+=("$file")
     done <<< "$selected"
@@ -501,15 +502,18 @@ cmd_backup() {
     fi
 
     # FIRST: Copy files to temp (before any git operations)
-    local temp_dir
     temp_dir=$(mktemp -d)
     for file in "${files_to_backup[@]}"; do
         cp -r "$file" "$temp_dir/"
     done
     info "Files saved to temp directory"
 
-    # Stash any tracked changes
-    local stash_needed=false
+    # Clear skip-worktree and restore eslint.config.js from upstream
+    # (we'll re-patch it at the end, so local changes are discarded)
+    git update-index --no-skip-worktree eslint.config.js 2>/dev/null || true
+    git checkout upstream/main -- eslint.config.js 2>/dev/null || true
+
+    # Stash any other tracked changes
     if ! git diff --quiet || ! git diff --cached --quiet; then
         git stash push -m "workflow-tool: stash before backup"
         stash_needed=true
@@ -518,7 +522,7 @@ cmd_backup() {
     # Cleanup function to restore state on error
     cleanup_backup() {
         local exit_code=$?
-        if [[ -d "$temp_dir" ]]; then
+        if [[ -n "$temp_dir" && -d "$temp_dir" ]]; then
             # Restore files from temp
             for file in "${files_to_backup[@]}"; do
                 [[ -e "$temp_dir/$(basename "$file")" ]] && cp -r "$temp_dir/$(basename "$file")" "$file"
@@ -526,10 +530,13 @@ cmd_backup() {
             rm -rf "$temp_dir"
         fi
         # Try to get back to original branch
-        git checkout -f "$current" 2>/dev/null || true
+        git checkout "$current" 2>/dev/null || true
         if [[ "$stash_needed" == "true" ]]; then
             git stash pop 2>/dev/null || true
         fi
+        # Re-patch eslint and restore skip-worktree
+        inject_eslint_ignore 2>/dev/null || true
+        git update-index --skip-worktree eslint.config.js 2>/dev/null || true
         return $exit_code
     }
     trap cleanup_backup EXIT
@@ -556,9 +563,8 @@ cmd_backup() {
     else
         # Create new orphan branch
         git checkout --orphan "$ORPHAN_BRANCH"
-        # Remove all files from index and working dir for clean slate
-        git rm -rf . 2>/dev/null || true
-        git clean -fd 2>/dev/null || true
+        # Unstage everything (orphan starts with all files staged)
+        git reset 2>/dev/null || true
     fi
 
     # Copy files from temp to working directory
@@ -575,15 +581,11 @@ cmd_backup() {
         info "Committed backup"
     fi
 
-    # Clean up orphan branch working dir before switching back
-    # Only remove files that aren't in our backup set
-    git clean -fd 2>/dev/null || true
-
     # Remove trap before normal exit
     trap - EXIT
 
-    # Go back to original branch (force to handle any conflicts)
-    git checkout -f "$current"
+    # Go back to original branch
+    git checkout "$current"
 
     # Restore our local files from temp
     for file in "${files_to_backup[@]}"; do
@@ -595,6 +597,10 @@ cmd_backup() {
     if [[ "$stash_needed" == "true" ]]; then
         git stash pop || warn "Stash pop had conflicts"
     fi
+
+    # Re-patch eslint.config.js and restore skip-worktree
+    inject_eslint_ignore
+    git update-index --skip-worktree eslint.config.js 2>/dev/null || true
 
     # Ensure branch has no upstream (prevents accidental push)
     git branch --unset-upstream "$ORPHAN_BRANCH" 2>/dev/null || true
