@@ -194,6 +194,60 @@ is_valid_type() {
 # Core Functions
 # =============================================================================
 
+STASH_PREFIX="workflow-auto:"
+
+# Find stash index for a specific branch
+find_branch_stash() {
+    local branch="$1"
+    local result
+    # Return the stash ref (e.g., stash@{0}) if found, empty otherwise
+    # Use || true to handle grep returning 1 when no match (with pipefail)
+    result=$(git stash list | grep -m1 "$STASH_PREFIX $branch\$" | cut -d: -f1 || true)
+    echo "$result"
+}
+
+# Stash current branch's changes with branch name
+auto_stash_branch() {
+    local branch
+    branch=$(current_branch)
+    [[ -z "$branch" ]] && return 1
+
+    # Prepare eslint (restore to upstream so it's not in our branch stash)
+    git update-index --no-skip-worktree eslint.config.js 2>/dev/null || true
+    git checkout upstream/main -- eslint.config.js 2>/dev/null || true
+
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        git stash push -m "$STASH_PREFIX $branch"
+        info "Stashed changes for branch: $branch"
+        return 0
+    fi
+    return 1  # No changes to stash
+}
+
+# Pop stash for a specific branch if it exists
+auto_pop_branch() {
+    local branch="$1"
+    local stash_ref
+    stash_ref=$(find_branch_stash "$branch")
+
+    if [[ -n "$stash_ref" ]]; then
+        if git stash pop "$stash_ref"; then
+            info "Restored changes for branch: $branch"
+            return 0
+        else
+            warn "Stash pop had conflicts for $branch - resolve manually"
+            return 1
+        fi
+    fi
+    return 0  # No stash to pop is not an error
+}
+
+# Finalize eslint after operations (patch and hide from status)
+finalize_eslint() {
+    inject_eslint_ignore
+    git update-index --skip-worktree eslint.config.js 2>/dev/null || true
+}
+
 # Inject .history/** into eslint.config.js ignores
 inject_eslint_ignore() {
     local eslint_file="eslint.config.js"
@@ -344,6 +398,8 @@ cmd_checkout() {
     header "Switch Branch"
 
     local target_branch="${1:-}"
+    # Not local - needed by trap handler
+    _checkout_current=$(current_branch)
 
     if [[ -z "$target_branch" ]]; then
         # Interactive branch selection with fzf
@@ -359,8 +415,50 @@ cmd_checkout() {
         fi
     fi
 
+    # Don't switch to same branch
+    if [[ "$target_branch" == "$_checkout_current" ]]; then
+        info "Already on branch: $target_branch"
+        return
+    fi
+
+    # Track state for recovery (not local - needed by trap handler)
+    _checkout_stashed=false
+
+    # Recovery function
+    cleanup_checkout() {
+        local exit_code=$?
+        if [[ $exit_code -ne 0 ]]; then
+            warn "Checkout failed, attempting recovery..."
+            # Try to get back to original branch
+            git checkout "$_checkout_current" 2>/dev/null || true
+            # If we stashed, pop it back
+            if [[ "$_checkout_stashed" == "true" ]]; then
+                local stash_ref
+                stash_ref=$(find_branch_stash "$_checkout_current")
+                [[ -n "$stash_ref" ]] && git stash pop "$stash_ref" 2>/dev/null || true
+            fi
+            finalize_eslint
+        fi
+        return $exit_code
+    }
+    trap cleanup_checkout EXIT
+
+    # Auto-stash current branch's changes
+    if auto_stash_branch; then
+        _checkout_stashed=true
+    fi
+
     info "Switching to branch: $target_branch"
     git checkout "$target_branch"
+
+    # Auto-pop target branch's stash if exists
+    auto_pop_branch "$target_branch"
+
+    # Finalize eslint (patch and skip-worktree)
+    finalize_eslint
+
+    # Clear trap on success
+    trap - EXIT
 
     ensure_local_files
 }
@@ -370,6 +468,8 @@ cmd_create() {
 
     require_cmd gum
 
+    # Not local - needed by trap handler
+    _create_current=$(current_branch)
     local branch_type=""
     local branch_name=""
     local full_branch=""
@@ -420,12 +520,46 @@ cmd_create() {
 
     info "Creating branch: $full_branch"
 
-    # First merge upstream
+    # Track state for recovery (not local - needed by trap handler)
+    _create_stashed=false
+
+    # Recovery function
+    cleanup_create() {
+        local exit_code=$?
+        if [[ $exit_code -ne 0 ]]; then
+            warn "Branch creation failed, attempting recovery..."
+            git checkout "$_create_current" 2>/dev/null || true
+            if [[ "$_create_stashed" == "true" ]]; then
+                local stash_ref
+                stash_ref=$(find_branch_stash "$_create_current")
+                [[ -n "$stash_ref" ]] && git stash pop "$stash_ref" 2>/dev/null || true
+            fi
+            finalize_eslint
+        fi
+        return $exit_code
+    }
+    trap cleanup_create EXIT
+
+    # Auto-stash current branch's changes (they stay with this branch)
+    if auto_stash_branch; then
+        _create_stashed=true
+    fi
+
+    # Merge upstream (working tree is now clean)
     info "Merging upstream first..."
     cmd_merge
 
-    # Create and switch to new branch
+    # Re-set trap (cmd_merge clears EXIT trap)
+    trap cleanup_create EXIT
+
+    # Create and switch to new branch (starts clean from upstream)
     git checkout -b "$full_branch"
+
+    # Finalize eslint
+    finalize_eslint
+
+    # Clear trap on success
+    trap - EXIT
 
     info "Created and switched to: $full_branch"
 
