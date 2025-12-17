@@ -52,9 +52,11 @@ get_editor_settings_path() {
 # Track original autorefresh state for restoration
 _original_autorefresh=""
 _settings_path=""
+_skip_refresh_toggle=false
 
 # Pause VSCode git autorefresh (call at start of git-heavy operations)
 pause_git_autorefresh() {
+    [[ "$_skip_refresh_toggle" == "true" ]] && return 0
     _settings_path=$(get_editor_settings_path)
     [[ -z "$_settings_path" ]] && return 0
 
@@ -72,19 +74,63 @@ pause_git_autorefresh() {
     if jq '.["git.autorefresh"] = false' "$_settings_path" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$_settings_path"
         info "Paused VSCode git autorefresh"
+        sleep 0.5  # Let VSCode notice the change
     else
         rm -f "$tmp"
     fi
 }
 
-# Resume VSCode git autorefresh (call at end of git-heavy operations)
+# Trigger one-time git refresh after an operation
+# Enable autorefresh briefly, touch index, then disable again
+trigger_git_refresh() {
+    [[ "$_skip_refresh_toggle" == "true" ]] && return 0
+    [[ -z "$_settings_path" ]] && return 0
+    [[ ! -f "$_settings_path" ]] && return 0
+    command -v jq &>/dev/null || return 0
+
+    local tmp
+    tmp=$(mktemp)
+
+    # Enable autorefresh
+    if jq '.["git.autorefresh"] = true' "$_settings_path" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$_settings_path"
+    else
+        rm -f "$tmp"
+        return 0
+    fi
+
+    # Wait for VSCode to notice setting change
+    sleep 0.5
+
+    # Touch index to trigger refresh
+    touch .git/index 2>/dev/null || true
+
+    # Wait for refresh to process
+    sleep 0.5
+
+    # Disable autorefresh again
+    tmp=$(mktemp)
+    if jq '.["git.autorefresh"] = false' "$_settings_path" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$_settings_path"
+    else
+        rm -f "$tmp"
+    fi
+
+    # Wait for VSCode to notice disabled state
+    sleep 0.5
+
+    info "Git refreshed"
+}
+
+# Restore original autorefresh setting (call at script exit)
 # Idempotent - safe to call multiple times
 resume_git_autorefresh() {
+    [[ "$_skip_refresh_toggle" == "true" ]] && return 0
     [[ -z "$_settings_path" ]] && return 0
     [[ ! -f "$_settings_path" ]] && return 0
 
     if ! command -v jq &>/dev/null; then
-        _settings_path=""  # Mark as done
+        _settings_path=""
         return 0
     fi
 
@@ -107,11 +153,10 @@ resume_git_autorefresh() {
         fi
     fi
 
-    info "Resumed VSCode git autorefresh"
+    # Wait for VSCode to notice restored setting
+    sleep 0.5
 
-    # Trigger git extension refresh by touching the index
-    touch .git/index 2>/dev/null || true
-
+    info "Restored git autorefresh setting"
     _settings_path=""  # Mark as done (idempotent)
 }
 
@@ -500,6 +545,8 @@ cmd_merge() {
     info "Successfully synced with upstream!"
     echo ""
     git status --short
+
+    trigger_git_refresh
 }
 
 cmd_checkout() {
@@ -558,6 +605,8 @@ cmd_checkout() {
     trap - EXIT
 
     ensure_local_files
+
+    trigger_git_refresh
 }
 
 cmd_create() {
@@ -653,6 +702,8 @@ cmd_create() {
     info "Created and switched to: $full_branch"
 
     ensure_local_files
+
+    trigger_git_refresh
 }
 
 cmd_backup() {
@@ -835,6 +886,8 @@ cmd_backup() {
 
     info "Backup complete!"
     warn "Note: Backup branch is LOCAL ONLY (never pushed) to protect private data"
+
+    trigger_git_refresh
 }
 
 cmd_restore() {
@@ -873,6 +926,8 @@ cmd_restore() {
     chmod +x workflow-tool.bash 2>/dev/null || true
 
     info "Restore complete!"
+
+    trigger_git_refresh
 }
 
 cmd_status() {
@@ -1060,7 +1115,10 @@ interactive_menu() {
 
 usage() {
     cat <<'EOF'
-Usage: ./workflow-tool.bash [command] [args]
+Usage: ./workflow-tool.bash [options] [command] [args]
+
+Options:
+  --no-refresh        Disable VSCode git autorefresh toggling
 
 Commands:
   (none)              Interactive menu
@@ -1077,13 +1135,28 @@ Valid types: fix, feat, refactor, chore, docs
 
 Examples:
   ./workflow-tool.bash create feat/new-feature
-  ./workflow-tool.bash create fix/typo
+  ./workflow-tool.bash --no-refresh merge
   ./workflow-tool.bash checkout
   ./workflow-tool.bash merge
 EOF
 }
 
 main() {
+    # Parse global options
+    while [[ $# -gt 0 && "$1" == --* ]]; do
+        case "$1" in
+            --no-refresh)
+                _skip_refresh_toggle=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
     ensure_repo
 
     local repo_root
