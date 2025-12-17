@@ -24,6 +24,7 @@ ORPHAN_BRANCH="nubebuster/local/workflow"
 GH_PR_SCRIPT="$HOME/Scripts/gh-pr.bash"
 GITIGNORE_LOCAL=".gitignore_local"
 BACKUP_PREFS_FILE=".workflow-backup-prefs"
+ESLINT_CONFIG="eslint.config.js"
 
 # Valid branch types for naming convention
 BRANCH_TYPES=("fix" "feat" "refactor" "chore" "docs")
@@ -196,6 +197,10 @@ is_valid_type() {
 
 STASH_PREFIX="workflow-auto:"
 
+# Variables for cleanup handlers (not local - trap handlers need access)
+_cleanup_branch=""
+_cleanup_stashed=false
+
 # Find stash index for a specific branch
 find_branch_stash() {
     local branch="$1"
@@ -206,6 +211,23 @@ find_branch_stash() {
     echo "$result"
 }
 
+# Recovery helper for branch operations (checkout, create)
+# Uses _cleanup_branch and _cleanup_stashed variables set by caller
+# Args: $1 = operation name for warning message
+_recover_branch_operation() {
+    local operation="$1"
+    warn "$operation failed, attempting recovery..."
+    git checkout "$_cleanup_branch" 2>/dev/null || true
+    if [[ "$_cleanup_stashed" == "true" ]]; then
+        local stash_ref
+        stash_ref=$(find_branch_stash "$_cleanup_branch")
+        if [[ -n "$stash_ref" ]]; then
+            git stash pop "$stash_ref" 2>/dev/null || true
+        fi
+    fi
+    finalize_eslint
+}
+
 # Stash current branch's changes with branch name
 auto_stash_branch() {
     local branch
@@ -213,8 +235,8 @@ auto_stash_branch() {
     [[ -z "$branch" ]] && return 1
 
     # Prepare eslint (restore to upstream so it's not in our branch stash)
-    git update-index --no-skip-worktree eslint.config.js 2>/dev/null || true
-    git checkout upstream/main -- eslint.config.js 2>/dev/null || true
+    eslint_clear_skip_worktree
+    git checkout upstream/main -- "$ESLINT_CONFIG" 2>/dev/null || true
 
     if ! git diff --quiet || ! git diff --cached --quiet; then
         git stash push -m "$STASH_PREFIX $branch"
@@ -245,35 +267,38 @@ auto_pop_branch() {
 # Finalize eslint after operations (patch and hide from status)
 finalize_eslint() {
     inject_eslint_ignore
-    git update-index --skip-worktree eslint.config.js 2>/dev/null || true
+    git update-index --skip-worktree "$ESLINT_CONFIG" 2>/dev/null || true
+}
+
+# Clear skip-worktree on eslint config (before git operations that need to modify it)
+eslint_clear_skip_worktree() {
+    git update-index --no-skip-worktree "$ESLINT_CONFIG" 2>/dev/null || true
 }
 
 # Inject .history/** into eslint.config.js ignores
 inject_eslint_ignore() {
-    local eslint_file="eslint.config.js"
-
-    if [[ ! -f "$eslint_file" ]]; then
-        warn "eslint.config.js not found, skipping injection"
+    if [[ ! -f "$ESLINT_CONFIG" ]]; then
+        warn "$ESLINT_CONFIG not found, skipping injection"
         return
     fi
 
     # Check if .history/** already in ignores (handles both quote styles)
-    if grep -qE "['\"].history/\*\*['\"]" "$eslint_file" 2>/dev/null; then
-        info "eslint.config.js already has .history/** ignore"
+    if grep -qE "['\"].history/\*\*['\"]" "$ESLINT_CONFIG" 2>/dev/null; then
+        info "$ESLINT_CONFIG already has .history/** ignore"
         return
     fi
 
     # Inject after 'dist/**' line in ignores array (handles both quote styles)
-    if grep -q "'dist/\*\*'" "$eslint_file"; then
+    if grep -q "'dist/\*\*'" "$ESLINT_CONFIG"; then
         # Single quotes - match upstream style
-        sed -i "/'dist\/\*\*'/a\\      '.history/**'," "$eslint_file"
-        info "Injected .history/** into eslint.config.js"
-    elif grep -q '"dist/\*\*"' "$eslint_file"; then
+        sed -i "/'dist\/\*\*'/a\\      '.history/**'," "$ESLINT_CONFIG"
+        info "Injected .history/** into $ESLINT_CONFIG"
+    elif grep -q '"dist/\*\*"' "$ESLINT_CONFIG"; then
         # Double quotes
-        sed -i '/"dist\/\*\*"/a\      ".history/**",' "$eslint_file"
-        info "Injected .history/** into eslint.config.js"
+        sed -i '/"dist\/\*\*"/a\      ".history/**",' "$ESLINT_CONFIG"
+        info "Injected .history/** into $ESLINT_CONFIG"
     else
-        warn "Could not find dist/** in eslint.config.js, manual injection may be needed"
+        warn "Could not find dist/** in $ESLINT_CONFIG, manual injection may be needed"
     fi
 }
 
@@ -331,14 +356,14 @@ cmd_merge() {
         git remote add upstream "$UPSTREAM_URL"
     fi
 
-    # Reset eslint.config.js before stashing - we'll re-patch it from upstream anyway
+    # Reset eslint config before stashing - we'll re-patch it from upstream anyway
     # This prevents stash conflicts since eslint changes shouldn't be in the stash
-    if git diff --name-only | grep -q '^eslint.config.js$'; then
-        info "Resetting eslint.config.js (will be re-patched from upstream)"
-        git checkout -- eslint.config.js
+    if git diff --name-only | grep -q "^${ESLINT_CONFIG}\$"; then
+        info "Resetting $ESLINT_CONFIG (will be re-patched from upstream)"
+        git checkout -- "$ESLINT_CONFIG"
     fi
 
-    # Stash tracked changes (eslint.config.js excluded above)
+    # Stash tracked changes (eslint config excluded above)
     local stash_needed=false
     if ! git diff --quiet || ! git diff --cached --quiet; then
         info "Stashing tracked changes..."
@@ -367,18 +392,15 @@ cmd_merge() {
         git fetch upstream "$UPSTREAM_BRANCH"
     fi
 
-    # Clear skip-worktree on eslint.config.js so reset can overwrite it
-    git update-index --no-skip-worktree eslint.config.js 2>/dev/null || true
+    # Clear skip-worktree on eslint config so reset can overwrite it
+    eslint_clear_skip_worktree
 
     # Reset to upstream
     info "Resetting to upstream/$UPSTREAM_BRANCH..."
     git reset --hard "upstream/$UPSTREAM_BRANCH"
 
-    # Now eslint.config.js is fresh from upstream, inject our ignore
-    inject_eslint_ignore
-
-    # Re-enable skip-worktree so eslint.config.js doesn't show in git status
-    git update-index --skip-worktree eslint.config.js
+    # Now eslint config is fresh from upstream, inject our ignore and finalize
+    finalize_eslint
 
     # Remove trap - we're done with critical section
     trap - EXIT
@@ -398,8 +420,9 @@ cmd_checkout() {
     header "Switch Branch"
 
     local target_branch="${1:-}"
-    # Not local - needed by trap handler
-    _checkout_current=$(current_branch)
+    # Set cleanup state (uses global _cleanup_* variables for trap handler)
+    _cleanup_branch=$(current_branch)
+    _cleanup_stashed=false
 
     if [[ -z "$target_branch" ]]; then
         # Interactive branch selection with fzf
@@ -416,28 +439,16 @@ cmd_checkout() {
     fi
 
     # Don't switch to same branch
-    if [[ "$target_branch" == "$_checkout_current" ]]; then
+    if [[ "$target_branch" == "$_cleanup_branch" ]]; then
         info "Already on branch: $target_branch"
         return
     fi
 
-    # Track state for recovery (not local - needed by trap handler)
-    _checkout_stashed=false
-
-    # Recovery function
+    # Recovery function using shared helper
     cleanup_checkout() {
         local exit_code=$?
         if [[ $exit_code -ne 0 ]]; then
-            warn "Checkout failed, attempting recovery..."
-            # Try to get back to original branch
-            git checkout "$_checkout_current" 2>/dev/null || true
-            # If we stashed, pop it back
-            if [[ "$_checkout_stashed" == "true" ]]; then
-                local stash_ref
-                stash_ref=$(find_branch_stash "$_checkout_current")
-                [[ -n "$stash_ref" ]] && git stash pop "$stash_ref" 2>/dev/null || true
-            fi
-            finalize_eslint
+            _recover_branch_operation "Checkout"
         fi
         return $exit_code
     }
@@ -445,7 +456,7 @@ cmd_checkout() {
 
     # Auto-stash current branch's changes
     if auto_stash_branch; then
-        _checkout_stashed=true
+        _cleanup_stashed=true
     fi
 
     info "Switching to branch: $target_branch"
@@ -468,8 +479,10 @@ cmd_create() {
 
     require_cmd gum
 
-    # Not local - needed by trap handler
-    _create_current=$(current_branch)
+    # Set cleanup state (uses global _cleanup_* variables for trap handler)
+    _cleanup_branch=$(current_branch)
+    _cleanup_stashed=false
+
     local branch_type=""
     local branch_name=""
     local full_branch=""
@@ -520,21 +533,11 @@ cmd_create() {
 
     info "Creating branch: $full_branch"
 
-    # Track state for recovery (not local - needed by trap handler)
-    _create_stashed=false
-
-    # Recovery function
+    # Recovery function using shared helper
     cleanup_create() {
         local exit_code=$?
         if [[ $exit_code -ne 0 ]]; then
-            warn "Branch creation failed, attempting recovery..."
-            git checkout "$_create_current" 2>/dev/null || true
-            if [[ "$_create_stashed" == "true" ]]; then
-                local stash_ref
-                stash_ref=$(find_branch_stash "$_create_current")
-                [[ -n "$stash_ref" ]] && git stash pop "$stash_ref" 2>/dev/null || true
-            fi
-            finalize_eslint
+            _recover_branch_operation "Branch creation"
         fi
         return $exit_code
     }
@@ -542,7 +545,7 @@ cmd_create() {
 
     # Auto-stash current branch's changes (they stay with this branch)
     if auto_stash_branch; then
-        _create_stashed=true
+        _cleanup_stashed=true
     fi
 
     # Merge upstream (working tree is now clean)
@@ -636,16 +639,19 @@ cmd_backup() {
     fi
 
     # FIRST: Copy files to temp (before any git operations)
+    # Note: Files are copied flat using their basenames. This works correctly for
+    # root-level files/dirs in .gitignore_local. Would need adjustment if nested
+    # paths with duplicate basenames are ever added.
     temp_dir=$(mktemp -d)
     for file in "${files_to_backup[@]}"; do
         cp -r "$file" "$temp_dir/"
     done
     info "Files saved to temp directory"
 
-    # Clear skip-worktree and restore eslint.config.js from upstream
+    # Clear skip-worktree and restore eslint config from upstream
     # (we'll re-patch it at the end, so local changes are discarded)
-    git update-index --no-skip-worktree eslint.config.js 2>/dev/null || true
-    git checkout upstream/main -- eslint.config.js 2>/dev/null || true
+    eslint_clear_skip_worktree
+    git checkout upstream/main -- "$ESLINT_CONFIG" 2>/dev/null || true
 
     # Stash any other tracked changes
     if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -669,8 +675,7 @@ cmd_backup() {
             git stash pop 2>/dev/null || true
         fi
         # Re-patch eslint and restore skip-worktree
-        inject_eslint_ignore 2>/dev/null || true
-        git update-index --skip-worktree eslint.config.js 2>/dev/null || true
+        finalize_eslint
         return $exit_code
     }
     trap cleanup_backup EXIT
@@ -732,9 +737,8 @@ cmd_backup() {
         git stash pop || warn "Stash pop had conflicts"
     fi
 
-    # Re-patch eslint.config.js and restore skip-worktree
-    inject_eslint_ignore
-    git update-index --skip-worktree eslint.config.js 2>/dev/null || true
+    # Re-patch eslint config and restore skip-worktree
+    finalize_eslint
 
     # Ensure branch has no upstream (prevents accidental push)
     git branch --unset-upstream "$ORPHAN_BRANCH" 2>/dev/null || true
